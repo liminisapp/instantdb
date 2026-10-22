@@ -42,6 +42,8 @@ function addQueryOk(reactor, q, joinRows) {
 // as a re-rendering useQuery reads it.
 async function setup() {
   const reactor = new Reactor({ appId: uuid() });
+  // These tests count replays to see recomputes; a resumed replay applies none.
+  reactor._incrementalReplay = false;
   reactor._initStorage(IndexedDBStorage);
   reactor._setAttrs(zenecaAttrs);
   const q = { users: {} };
