@@ -32,6 +32,7 @@ import {
   queryFootprint,
   footprintsIntersect,
 } from './notifyScope.ts';
+import { replayIncrementally } from './replayCache.ts';
 import { InstantError } from './InstantError.ts';
 import { InstantAPIError } from './utils/fetch.ts';
 import { validate as validateUUID } from 'uuid';
@@ -290,6 +291,14 @@ export default class Reactor {
   // Memoises dataForQuery between notifies. Separate from _dataForQueryCache,
   // which notifyOne uses as its last-notified value for deduping.
   _dataForQueryMemo = {};
+  /**
+   * Each query's last optimistic replay, resumed when only new pending
+   * mutations were added since (see replayCache.ts).
+   * @type {import('./replayCache.ts').ReplayCache}
+   */
+  _replayCache = new Map();
+  /** false replays every pending mutation on every recompute. */
+  _incrementalReplay = true;
   /** @type {Logger} */
   _log;
   _pendingTxCleanupTimeout;
@@ -1269,6 +1278,7 @@ export default class Reactor {
     delete this._dataForQueryMemo[hash];
     delete this._dataForQueryMemo['!' + hash];
     this._queryFootprints.delete(hash);
+    this._replayCache.delete(hash);
     this.querySubs.unloadKey(hash);
 
     this._trySendAuthed(uuid(), { op: 'remove-query', q });
@@ -1462,17 +1472,35 @@ export default class Reactor {
     let store = result.store;
     let attrsStore = result.attrsStore;
     const { pageInfo, aggregate, processedTxId } = result;
-    const mutations = this._rewriteMutationsSorted(
+    const rewrittenMutations = this._rewriteMutations(
       attrsStore,
       pendingMutations,
     );
+    const mutations = sortedMutationEntries(rewrittenMutations.entries());
     if (applyOptimistic) {
-      const optimisticResult = this._applyOptimisticUpdates(
-        store,
-        attrsStore,
-        mutations,
-        processedTxId,
-      );
+      // A rewrite builds new mutation objects on every call, so only an
+      // unrewritten list can resume from the last replay.
+      const optimisticResult =
+        this._incrementalReplay && rewrittenMutations === pendingMutations
+          ? replayIncrementally(
+              this._replayCache,
+              hash,
+              result,
+              mutations,
+              (store, attrsStore, mutations, processedTxId) =>
+                this._applyOptimisticUpdates(
+                  store,
+                  attrsStore,
+                  mutations,
+                  processedTxId,
+                ),
+            )
+          : this._applyOptimisticUpdates(
+              store,
+              attrsStore,
+              mutations,
+              processedTxId,
+            );
 
       store = optimisticResult.store;
       attrsStore = optimisticResult.attrsStore;
@@ -1506,6 +1534,8 @@ export default class Reactor {
 
     if (!resp?.data) return;
     this._dataForQueryCache[hash] = resp;
+    // dataForQuery handed back the object already delivered.
+    if (resp.data === prevData) return;
     if (areObjectsDeepEqual(resp.data, prevData)) return;
 
     cbs.forEach((r) => r.cb(resp.data));
@@ -2403,6 +2433,7 @@ export default class Reactor {
     this._currentUserCached = { isLoading: false, ...newV };
     this._dataForQueryCache = {};
     this._dataForQueryMemo = {};
+    this._replayCache.clear();
     this.querySubs.updateInPlace((prev) => {
       Object.keys(prev).forEach((k) => {
         delete prev[k].result;
