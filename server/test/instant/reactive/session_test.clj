@@ -1861,3 +1861,46 @@
       (testing "a rule that indexes data falls back to every field"
         (is (refreshed-by? store sess {:books {:$ {:fields ["title"]}}}
                            (set-value r "eid-catch-and-kill" :books/pageCount 1)))))))
+
+(defn- create-entities!
+  "Creates an entity with `id-attr` for each of `eids`, plus any `tx-steps`."
+  [{:keys [app-id]} r id-attr eids tx-steps]
+  (tx/transact! (aurora/conn-pool :write)
+                (attr-model/get-by-app-id app-id)
+                app-id
+                (concat (for [e eids]
+                          [:add-triple e (resolvers/->uuid r id-attr) (str e)])
+                        tx-steps)))
+
+(deftest ref-rule-paths-refresh-for-partial-matches
+  (testing "the first link on a path, for an entity that has no link yet"
+    (with-permissioned-session
+      {:bookshelves {:allow {:view "'alex' in data.ref('users.handle')"}}}
+      (fn [store sess r]
+        (let [alex (resolvers/->uuid r "eid-alex")
+              user-shelves (resolvers/->uuid r :users/bookshelves)
+              shelf (random-uuid)]
+          (create-entities! sess r :bookshelves/id [shelf] [])
+          (is (refreshed-by? store sess {:bookshelves {:$ {:fields ["order"]}}}
+                             [alex user-shelves [[:add-triple alex user-shelves shelf]]]))))))
+  (testing "a later link on a path, for an entity that has only the first link"
+    (with-permissioned-session
+      {:books {:allow {:view "'alex' in data.ref('bookshelves.users.handle')"}}}
+      (fn [store sess r]
+        (let [alex (resolvers/->uuid r "eid-alex")
+              user-shelves (resolvers/->uuid r :users/bookshelves)
+              shelf-books (resolvers/->uuid r :bookshelves/books)
+              shelf (random-uuid)
+              book (random-uuid)
+              q {:books {:$ {:fields ["title"]}}}]
+          (create-entities! sess r :books/id [book] [])
+          (create-entities! sess r :bookshelves/id [shelf] [])
+          (testing "linking the first entity"
+            (is (refreshed-by? store sess q [shelf shelf-books [[:add-triple shelf shelf-books book]]])))
+          (testing "linking the next entity"
+            (is (refreshed-by? store sess q [alex user-shelves [[:add-triple alex user-shelves shelf]]])))
+          (testing "a field that the rule doesn't read"
+            (is (not (refreshed-by? store sess q (set-value r "eid-alex" :users/email "alex@example.com")))))
+          (testing "a field of the row that the rule doesn't read"
+            (is (not (refreshed-by? store sess q [book (resolvers/->uuid r :books/pageCount)
+                                                  [[:add-triple book (resolvers/->uuid r :books/pageCount) 1]]])))))))))
