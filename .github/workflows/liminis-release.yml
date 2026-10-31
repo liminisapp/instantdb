@@ -1,0 +1,125 @@
+# Builds, tests and publishes @liminis/instant-core and @liminis/instant-react-common,
+# the unofficial builds of @instantdb/core and @instantdb/react-common from this branch.
+#
+# Release by pushing a tag `lm-v<version>` on a liminis-patches commit, e.g.
+# `lm-v1.0.67-lm.1`. The version must be the upstream version in
+# client/packages/version/src/version.ts plus `-lm.N`.
+#
+# The packed tarballs are always kept as the run's `packages` artifact. The publish
+# job only runs when the repository variable LIMINIS_NPM_PUBLISH is `true`, which is
+# set once npm trusted publishing is configured for both packages. Until then, publish
+# the artifact's tarballs by hand. No npm token is stored: publishing uses OIDC.
+
+name: liminis release
+
+on:
+  push:
+    tags:
+      - 'lm-v*'
+
+concurrency:
+  group: liminis-release
+  cancel-in-progress: false
+
+jobs:
+  pack:
+    name: Build, test and pack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read the version from the tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#lm-v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          git fetch origin liminis-patches
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/liminis-patches; then
+            echo "::error::$TAG is not on liminis-patches"
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10.2.0'
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install dependencies
+        working-directory: client
+        run: pnpm i --frozen-lockfile
+
+      - name: Build packages
+        working-directory: client
+        run: pnpm run build-packages
+
+      - name: Test core
+        working-directory: client/packages/core
+        run: |
+          pnpm exec vitest run --project node
+          pnpm run test:types
+
+      - name: Prepare the packages
+        working-directory: client
+        run: node scripts/liminis/prepare-release.mjs "${{ steps.version.outputs.version }}"
+
+      - name: Pack
+        working-directory: client
+        run: |
+          mkdir -p "$RUNNER_TEMP/packages"
+          for p in core react-common; do
+            (cd "packages/$p" && pnpm pack --pack-destination "$RUNNER_TEMP/packages")
+          done
+          ls -l "$RUNNER_TEMP/packages"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: ${{ runner.temp }}/packages/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: pack
+    if: vars.LIMINIS_NPM_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          package-manager-cache: false
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - name: Update npm
+        run: npm install -g npm@^11.5.1
+
+      # Core first: react-common depends on this exact core version.
+      - name: Publish
+        env:
+          VERSION: ${{ needs.pack.outputs.version }}
+        run: |
+          npm publish "packages/liminis-instant-core-$VERSION.tgz" --tag latest --access public
+          npm publish "packages/liminis-instant-react-common-$VERSION.tgz" --tag latest --access public
