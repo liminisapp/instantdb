@@ -1,0 +1,312 @@
+# Releases liminisapp/instantdb: the server and dashboard images and every client
+# package, built from one commit at one version.
+#
+# Release by pushing a tag `lm-v<version>` on a self-hosted-patches commit, e.g.
+# `lm-v1.0.67-lm.2`. The version must be the upstream version in
+# client/packages/version/src/version.ts plus `-lm.N`.
+#
+#   images    ghcr.io/liminisapp/instant-server:<version>, :latest
+#             ghcr.io/liminisapp/instant-dashboard:<version>, :latest
+#   npm       @liminis/instant-* (all of client/packages), see
+#             client/scripts/liminis/prepare-release.mjs
+#   release   a GitHub release with the commits since upstream and the tarballs
+#
+# npm publishing only runs when the repository variable LIMINIS_NPM_PUBLISH is
+# `true`. It uses the secret NPM_TOKEN if it is set, which is only for the first
+# release, before the packages exist and trusted publishing can be configured
+# for them. Without it, publishing uses OIDC trusted publishing. Versions that
+# are already on npm are skipped, so a failed run can be re-run.
+
+name: liminis release
+
+on:
+  push:
+    tags:
+      - "lm-v*"
+
+concurrency:
+  group: liminis-release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read the version from the tag
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#lm-v}"
+          base=$(sed -n "s/^const version = 'v\([0-9.]*\)';$/\1/p" client/packages/version/src/version.ts)
+          if [[ ! "$version" =~ ^${base//./\\.}-lm\.[0-9]+$ ]]; then
+            echo "::error::$TAG must be lm-v${base}-lm.N, the upstream version this commit is on"
+            exit 1
+          fi
+          git fetch origin self-hosted-patches
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/self-hosted-patches; then
+            echo "::error::$TAG is not on self-hosted-patches"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  packages:
+    name: Build, test and pack the client packages
+    needs: version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10.2.0"
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Install dependencies
+        working-directory: client
+        run: pnpm i --frozen-lockfile
+
+      - name: Build packages
+        working-directory: client
+        run: pnpm run build-packages
+
+      - name: Test core
+        working-directory: client/packages/core
+        run: |
+          pnpm exec vitest run --project node
+          pnpm run test:types
+
+      - name: Test the CLI's install spec
+        working-directory: client/packages/cli
+        run: pnpm exec vitest run __tests__/sdkInstallSpec.test.ts
+
+      - name: Prepare the packages
+        working-directory: client
+        run: node scripts/liminis/prepare-release.mjs "${{ needs.version.outputs.version }}"
+
+      - name: Pack
+        working-directory: client
+        run: |
+          out="$RUNNER_TEMP/packages"
+          mkdir -p "$out"
+          for dir in $(jq -r '.packages[].dir' scripts/liminis/release-manifest.json); do
+            (cd "$GITHUB_WORKSPACE/$dir" && pnpm pack --pack-destination "$out")
+          done
+          cp scripts/liminis/release-manifest.json "$out/"
+          ls -l "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            ${{ runner.temp }}/packages/*.tgz
+            ${{ runner.temp }}/packages/release-manifest.json
+          if-no-files-found: error
+
+  images:
+    name: Build the ${{ matrix.image_name }} image (${{ matrix.platform_tag }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - image_name: server
+            context: ./server
+            file: ./server/Dockerfile.self-hosted
+            platform: linux/amd64
+            platform_tag: amd64
+            runner: ubuntu-latest
+          - image_name: server
+            context: ./server
+            file: ./server/Dockerfile.self-hosted
+            platform: linux/arm64
+            platform_tag: arm64
+            runner: ubuntu-24.04-arm
+          - image_name: dashboard
+            context: ./client
+            file: ./client/Dockerfile.www
+            platform: linux/amd64
+            platform_tag: amd64
+            runner: ubuntu-latest
+          - image_name: dashboard
+            context: ./client
+            file: ./client/Dockerfile.www
+            platform: linux/arm64
+            platform_tag: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      IMAGE: ghcr.io/liminisapp/instant-${{ matrix.image_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ needs.version.outputs.version }}-${{ matrix.platform_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/liminisapp/instantdb
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=registry,ref=${{ env.IMAGE }}:cache-${{ matrix.platform_tag }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}:cache-${{ matrix.platform_tag }},mode=max,image-manifest=true,oci-mediatypes=true
+
+  images-manifest:
+    name: Publish the ${{ matrix.image_name }} image
+    needs: [version, images, packages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        image_name: [server, dashboard]
+    env:
+      IMAGE: ghcr.io/liminisapp/instant-${{ matrix.image_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the multi-arch image
+        run: |
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
+            "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"
+
+  npm:
+    name: Publish to npm
+    needs: [version, packages, images-manifest]
+    if: vars.LIMINIS_NPM_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          package-manager-cache: false
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - name: Update npm
+        run: npm install -g npm@^11.5.1
+
+      # Dependencies first, in the order prepare-release.mjs worked out.
+      - name: Publish
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          # Only set for the first release; empty means OIDC trusted publishing.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for name in $(jq -r '.packages[].name' packages/release-manifest.json); do
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "$name@$VERSION is already published"
+              continue
+            fi
+            file="packages/$(echo "${name#@}" | tr / -)-$VERSION.tgz"
+            npm publish "$file" --tag latest --access public --provenance
+          done
+
+  release:
+    name: Create the GitHub release
+    needs: [version, packages, images-manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: packages
+
+      - name: Write the release notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          base=$(jq -r .base packages/release-manifest.json)
+          # Upstream's main, or our copy of it if upstream is gone.
+          git fetch --quiet https://github.com/instantdb/instant.git main \
+            || git fetch --quiet origin main
+          from=$(git merge-base HEAD FETCH_HEAD)
+          {
+            echo "Upstream $base (\`${from:0:8}\`) plus the commits below."
+            echo
+            echo "**Images**"
+            echo "- \`ghcr.io/liminisapp/instant-server:$VERSION\`"
+            echo "- \`ghcr.io/liminisapp/instant-dashboard:$VERSION\`"
+            echo
+            echo "**npm** — install each \`@instantdb/*\` package your app uses as an alias, pinned exactly:"
+            echo '```sh'
+            echo "npm install --save-exact @instantdb/react@npm:@liminis/instant-react@$VERSION"
+            echo '```'
+            echo
+            echo "**Changes from upstream**"
+            git log --reverse --format='- %s (%h)' "$from..HEAD"
+          } > notes.md
+          cat notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "$TAG" packages/*.tgz \
+            --title "$VERSION" --notes-file notes.md --verify-tag
