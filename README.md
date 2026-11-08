@@ -1,129 +1,106 @@
-<p align="center">
-  <a href="https://instantdb.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://instantdb.com/readmes/logo_with_text_dark_mode.svg">
-      <img alt="Shows the Instant logo" src="https://instantdb.com/readmes/logo_with_text_light_mode.svg">
-    </picture>
-  </a>
-</p>
+# Liminis Instant
 
-<p align="center">
-  <a 
-    href="https://discord.com/invite/VU53p7uQcE" >
-    <img height=20 src="https://img.shields.io/discord/1031957483243188235" />
-  </a>
-  <a href="#">
-    <img src="https://img.shields.io/github/stars/instantdb/instant" alt="stars">
-  </a>
-</p>
+**A maintained, self-hostable fork of [Instant](https://github.com/instantdb/instant).**
 
-<p align="center">
-   <a href="https://instantdb.com/docs">Get Started</a> · 
-   <a href="https://instantdb.com/examples">Examples</a> · 
-   <a href="https://instantdb.com/tutorial">Try the Demo</a> · 
-   <a href="https://instantdb.com/docs">Docs</a> · 
-   <a href="https://discord.com/invite/VU53p7uQcE">Discord</a>
-<p>
+Instant is a real-time, offline-first database with relational queries, permissions,
+auth, storage and presence. In August 2026 the Instant team
+[announced](https://github.com/instantdb/instant/blob/main/client/www/_posts/instant_team_joins_openai.md)
+that they are joining OpenAI. Instant Cloud closes on **31 August 2027**, and self-hosting is
+the way to keep running. This fork exists so that self-hosted Instant keeps getting fixes
+after that.
 
-Instant is the best backend for AI-coded apps. You get auth, permissions, storage, presence, and streams — everything you need to ship apps your users will love.
+It is maintained by Liminis, which runs its own production apps on it.
+It is not affiliated with or endorsed by the Instant team. "Instant" is used here only to
+describe what this is a fork of.
 
-You write [relational queries](https://www.instantdb.com/docs/instaql) in the shape of the data you want and Instant handles all the data fetching, permission checking, and offline caching. When you [change data](https://www.instantdb.com/docs/instaml), optimistic updates and rollbacks are handled for you as well. Plus, every query is multiplayer by default.
+> **Status: early.** The patched server and clients are in production use. The first
+> public release is being set up; see [Roadmap](#roadmap).
 
-We also support [ephemeral](https://www.instantdb.com/docs/presence-and-topics) updates, like cursors, or who's online. Currently we have SDKs for [Javascript](https://www.instantdb.com/docs/start-vanilla), [React](https://www.instantdb.com/docs/), and [React Native](https://www.instantdb.com/docs/start-rn).
+## How it relates to upstream
 
-How does it look? Here's a barebones chat app in about 12 lines:
+- **Upstream comes first.** Every fix here is offered upstream as an issue and a PR. When
+  upstream merges a fix, the fork drops its own copy and takes upstream's version.
+- **The patch stack stays small and rebased.** Branch `self-hosted-patches` is upstream
+  `main` plus a short stack of documented commits, rebased onto each new upstream commit we
+  adopt. `git log upstream/main..self-hosted-patches` is the whole difference.
+- **Drop-in compatible.** Same database schema, migrations, wire protocol and environment
+  variables as upstream. Existing `@instantdb/*` clients work against it unchanged.
+  You can go back to the upstream image by switching the image tag.
 
-```javascript
-// ༼ つ ◕_◕ ༽つ Real-time Chat
-// ----------------------------------
-// * Updates instantly
-// * Multiplayer
-// * Works offline
+## What's different from upstream
 
-import { init, id } from "@instantdb/react";
+Based on upstream [`15358ad7`](https://github.com/instantdb/instant/commit/15358ad7) (2026-11-05).
 
-const db = init({ 
-  appId: process.env.NEXT_PUBLIC_APP_ID,
-});
+| Fix | Why it matters when self-hosting | Upstream |
+|---|---|---|
+| **Never orphan a grouped-queue group when a pass dies** | If one invalidation pass died (realistically from an `OutOfMemoryError`), that app's queue was never drained again and grew for the life of the process | [#2930](https://github.com/instantdb/instant/issues/2930), PR [#2936](https://github.com/instantdb/instant/pull/2936) |
+| **Fetch each entity once when checking a transaction's permissions** | Entities touched by several ops in one transaction were fetched again for every op | PR [#2934](https://github.com/instantdb/instant/pull/2934) |
+| **Don't join an `or` at the start of a group to the previous CTE** | Nested `or`s failed with `ambiguous-column`, and an `or` starting a later top-level namespace could **silently return no rows** | [#2947](https://github.com/instantdb/instant/issues/2947), PR [#2948](https://github.com/instantdb/instant/pull/2948) |
+| **Subscribe a permission check only to the fields its rules read** | A live query with `fields` re-ran on a change to *any* field of the entities it returned | [#2951](https://github.com/instantdb/instant/issues/2951), PR [#2953](https://github.com/instantdb/instant/pull/2953) |
+| **Watch entities that only partly match a `data.ref` rule path** | A live query guarded by `data.ref(...)` didn't refresh when the first matching link was created; only a reload showed it | [#2952](https://github.com/instantdb/instant/issues/2952), PR [#2954](https://github.com/instantdb/instant/pull/2954) |
+| Test stub fix | Lets upstream's permission-helper test stub accept the new entity map | n/a |
 
-function Chat() {
-  // 1. Read
-  const { isLoading, error, data } = db.useQuery({
-    messages: {},
-  });
+Already merged upstream and dropped from the stack: *stop a self-hosted server buffering
+every transaction in memory* ([#2935](https://github.com/instantdb/instant/pull/2935)).
 
-  // 2. Write
-  const addMessage = (message) => {
-    db.transact(db.tx.messages[id()].update(message));
-  };
+Known and **not** fixed: a plain `where` through a link (for example
+`bookshelves where users.handle in [...]`) can leave a live query stale. That is in the core
+query engine and affects upstream equally.
 
-  // 3. Render!
-  return <UI data={data} onAdd={addMessage} />;
-}
+## Using it
+
+The server, the dashboard and every client package are released together, from one
+commit, at one version (`<upstream version>-lm.N`). See [Releases](https://github.com/liminisapp/instantdb/releases).
+
+**Server.** Follow upstream's [self-hosting guide](https://www.instantdb.com/docs/self-hosting)
+and use our images in place of upstream's:
+
+```yaml
+server:
+  image: ghcr.io/liminisapp/instant-server:1.0.67-lm.1
+dashboard:
+  image: ghcr.io/liminisapp/instant-dashboard:1.0.67-lm.1
 ```
 
-Want to see for yourself? <a href="https://instantdb.com/tutorial">try a demo in your browser.</a>
+**Clients.** Every `@instantdb/*` package is published as `@liminis/instant-*`. Install
+them under their upstream names, so your imports don't change, at the same version as
+the server, pinned exactly:
 
-## Motivation
-
-Writing modern apps is full of schleps. Most of the time you start with the server: stand up databases, caches, ORMs, and endpoints. Then you write client-side code: stores, selectors, mutators. Finally you paint a screen. If you add multiplayer you need to think about stateful servers, and if you support offline mode, you need to think about IndexedDB and transaction queues.
-
-To make things worse, whenever you add a new feature, you go through the same song and dance over and over again: add models, write endpoints, stores, selectors, and finally the UI.
-
-Could it be better?
-
-In 2021, **we realized that most of the schleps we face as UI engineers are actually database problems in disguise.** (We got into greater detail [in this essay](https://instantdb.com/essays/next_firebase))
-
-<p align="center">
-  <a href="#">
-    <img alt="Shows how Instant compresses schleps" src="https://instantdb.com/readmes/compression.svg">
-  </a>
-</p>
-
-If you had a database on the client, you wouldn't need to think about stores, selectors, endpoints, or local caches: just write queries. If these queries were multiplayer by default, you wouldn't have to worry about stateful servers. And if your database supported rollback, you'd get optimistic updates for free.
-
-So we built Instant. Instant gives you a database you can use in the client, so you can focus on what’s important: building a great UX for your users, and doing it quickly.
-
-## Architectural Overview
-
-Here's how Instant works at a high level:
-
-<p align="center">
-  <a href="#">
-    <img alt="Shows how Instant compresses schleps" src="https://instantdb.com/readmes/architecture.svg">
-  </a>
-</p>
-
-Under the hood, we store all user data as triples in one big Postgres database. A multi-tenant setup lets us offer a free tier that never pauses.
-
-A sync server written in Clojure talks to Postgres. We wrote a query engine that understands datalog and [InstaQL](https://www.instantdb.com/docs/instaql), a relational language that looks a lot like GraphQL:
-
-```javascript
-// give me all users, their posts and comments
-{
-  users: {
-    posts: {
-      comments: {
-      }
-    }
-  }
-}
+```sh
+npm install --save-exact \
+  @instantdb/react@npm:@liminis/instant-react@1.0.67-lm.1 \
+  @instantdb/admin@npm:@liminis/instant-admin@1.0.67-lm.1
 ```
 
-Taking inspiration from [Asana’s WorldStore](https://asana.com/inside-asana/worldstore-distributed-caching-reactivity-part-1) and [Figma’s LiveGraph](https://www.figma.com/blog/how-figmas-multiplayer-technology-works/#syncing-object-properties), we tail postgres’ WAL to detect novelty and invalidate relevant queries.
+Their dependencies on each other already point at our builds, so there is only one copy
+of each. The CLI is `@liminis/instant-cli`, and `npm create @liminis/instant-app`
+scaffolds an app that uses our packages.
 
-For the frontend, we wrote a client-side triple store. The SDK handles persisting a cache of recent queries to IndexedDB on web, and AsyncStorage in React Native.
+## Roadmap
 
-All data goes through a permission system powered by Google's [CEL library](https://github.com/google/cel-java).
+- [x] Versioned server and dashboard images on GHCR, and every client package on npm, released together
+- [ ] CI on every PR (Clojure and JS suites)
+- [x] Private vulnerability reporting (a `SECURITY.md` is still to write)
+- [ ] Docs for migrating from Instant Cloud to a self-hosted server
+- [ ] Track upstream until it stops, then carry security fixes ourselves
 
-## Getting Started
+## Security
 
-The easiest way to get started with Instant is by signing up on [instantdb.com](https://instantdb.com). [You can create a functional app in 5 minutes or less](https://instantdb.com/docs).
+Please don't open a public issue for a vulnerability. Report it privately through
+[GitHub's private vulnerability reporting](https://github.com/liminisapp/instantdb/security/advisories/new).
 
-If you have any questions, you can jump in on our [discord](https://discord.com/invite/VU53p7uQcE).
+If the issue also affects upstream Instant, we'll coordinate with the upstream maintainers
+while they are still accepting reports.
 
 ## Contributing
 
-You can start by joining our [discord](https://discord.com/invite/VU53p7uQcE) and introducing yourself. Even if you don't contribute code, we always love feedback.
+Issues and PRs are welcome, especially fixes for self-hosting problems. A good PR:
 
-If you want to make changes, start by reading the [`client`](./client/) and [`server`](./server/) READMEs. There you'll find instructions to start Instant locally.
+- is one focused change with a regression test that fails without it;
+- explains the *why* in the commit message, so it can be offered upstream as-is;
+- includes no hostnames, app ids or tokens from your own deployment.
+
+## License
+
+Apache-2.0, the same as upstream. See [LICENSE.md](LICENSE.md). Changes made in this fork
+are marked in the commit history.
