@@ -10,6 +10,7 @@ import { runUIEffect } from '../lib/ui.ts';
 import chalk from 'chalk';
 import { GlobalOpts } from './globalOpts.ts';
 import { BadArgsError } from '../errors.ts';
+import { sdkInstallSpec } from '../util/sdkInstallSpec.ts';
 
 export class ProjectInfo extends Context.Tag(
   'instant-cli/new/context/projectInfo',
@@ -162,7 +163,7 @@ const getProjectInfo = (
 
       const installCommand = getInstallCommand(
         pkgManager.agent,
-        packagesToInstall.join(' '),
+        packagesToInstall.map((p) => sdkInstallSpec(p)).join(' '),
       );
       yield* Effect.log(installCommand);
       yield* runUIEffect(
