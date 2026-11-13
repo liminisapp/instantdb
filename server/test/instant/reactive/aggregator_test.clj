@@ -14,9 +14,13 @@
    [instant.reactive.aggregator :as agg]
    [instant.util.crypt :as crypt-util]
    [instant.util.json :refer [->json]]
-   [instant.util.test :refer [wait-for]])
+   [instant.util.test :refer [wait-for]]
+   [instant.util.tracer :as tracer]
+   [clojure.core.async :as a])
   (:import
-   (java.util UUID)))
+   (java.sql SQLException SQLTransientConnectionException)
+   (java.util UUID)
+   (java.util.concurrent CancellationException)))
 
 (def ^:dynamic *in-test* false)
 
@@ -46,6 +50,99 @@
       (is (nil? (agg/fast-active-slot-check
                  {:get-conn-config (constantly {:host "transitioning"})
                   :slot-type agg/slot-type}))))))
+
+;; A Postgres outage must not stop the aggregator's slot listener for good: an
+;; escaped SQLException ends its go loop, and the slot then holds WAL until the
+;; server restarts. The same failure upstream #2944 fixes in the invalidator.
+
+(deftest fast-active-slot-check-waits-out-db-errors
+  (let [errors (atom [])]
+    (with-redefs [aurora/conn-pool (constantly nil)
+                  sql/select-one (fn [& _]
+                                   (throw (ex-info "Postgres connection failed" {}
+                                                   (SQLException. "connection failed"))))
+                  tracer/record-exception-span! (fn [_ {:keys [name]}] (swap! errors conj name))]
+      (is (true? (agg/fast-active-slot-check
+                  {:get-conn-config (with-meta (constantly nil) {:same-as-read-conn true})
+                   :slot-type agg/slot-type}))
+          "an unreadable slot state counts as busy: wait for the next check")
+      (is (= ["aggregator/active-slot-check-error"] @errors)))))
+
+(deftest fast-active-slot-check-preserves-cancellation-and-unexpected-errors
+  (doseq [error [(InterruptedException. "interrupted")
+                 (CancellationException. "cancelled")
+                 (SQLException. "interrupted connection" (InterruptedException.))
+                 (IllegalStateException. "unexpected")]]
+    (with-redefs [aurora/conn-pool (constantly nil)
+                  sql/select-one (fn [& _] (throw error))]
+      (is (identical? error
+                      (try
+                        (agg/fast-active-slot-check
+                         {:get-conn-config (with-meta (constantly nil) {:same-as-read-conn true})
+                          :slot-type agg/slot-type})
+                        (catch Exception e e)))))))
+
+(deftest stop-survives-kick-wal-failures
+  (let [errors (atom [])
+        kicks (atom 0)
+        release (promise)]
+    (with-redefs [aurora/conn-pool (constantly nil)
+                  wal/shutdown! (fn [_] @release)
+                  wal/kick-wal (fn [_]
+                                 (when (= 5 (swap! kicks inc)) (deliver release true))
+                                 (throw (SQLTransientConnectionException. "pool unavailable")))
+                  tracer/record-exception-span! (fn [_ {:keys [name]}] (swap! errors conj name))]
+      (let [opts {:to (a/chan) :close-signal-chan (a/chan)
+                  :flush-lsn-chan (a/chan) :worker-chan (a/chan)}
+            done (future (agg/stop opts))]
+        (is (not= ::timeout (deref done 3000 ::timeout)) "stop finishes despite failing kicks")
+        (is (<= 5 @kicks))
+        (is (= ["aggregator/kick-wal-error"] @errors) "one span, not one per retry")
+        (is (nil? (a/<!! (:to opts))) "channels are closed")))))
+
+(deftest slot-listener-recovers-after-db-outage
+  (let [errors (atom [])
+        checks (atom 0)
+        lsn-reads (atom 0)
+        claimed (promise)]
+    (with-redefs [aurora/conn-pool (constantly nil)
+                  sql/select-one (fn [& _]
+                                   (when (= 1 (swap! checks inc))
+                                     (throw (ex-info "Postgres connection failed" {}
+                                                     (SQLException. "connection failed"))))
+                                   {:active false})
+                  cms/get-start-lsn (fn [& _]
+                                      (if (= 1 (swap! lsn-reads inc))
+                                        (throw (SQLException. "connection failed"))
+                                        "0/0"))
+                  wal/start-aggregator-worker (fn [opts]
+                                                (deliver (:started-promise opts) true)
+                                                @claimed)
+                  wal/shutdown! (constantly nil)
+                  wal/kick-wal (constantly nil)
+                  tracer/record-exception-span! (fn [_ {:keys [name]}] (swap! errors conj name))]
+      (with-redefs-fn {#'agg/start-worker (fn [_]
+                                            (deliver claimed true)
+                                            {:shutdown (fn [] (a/go nil)) :completed-chan (a/chan)})}
+       (fn []
+      (let [{:keys [shutdown completed-chan]}
+            (agg/start-slot-listener
+             {:slot-suffix "test"
+              :acquire-slot-interval-ms 10
+              :sketch-flush-ms 1000
+              :sketch-flush-max-items 10
+              :process-id 1
+              :check-disabled (constantly false)
+              :get-conn-config (with-meta (constantly nil) {:same-as-read-conn true})
+              :slot-num 0})]
+        (try
+          (is (= true (deref claimed 2000 ::timeout))
+              "the listener claims the slot after a slot-check failure and a start-lsn failure")
+          (is (= ["aggregator/active-slot-check-error" "aggregator/get-start-lsn-error"] @errors))
+          (finally
+            (let [finished (future (shutdown))]
+              (is (not= ::timeout (deref finished 2000 ::timeout)) "explicit shutdown still finishes"))))
+        (is (= completed-chan (second (a/alts!! [completed-chan (a/timeout 1000)] :priority true))) "the listener process completes")))))))
 
 (defn copy-sql-for-app-ids
   "copy command that only copies the app we are interested in"
