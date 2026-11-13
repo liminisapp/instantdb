@@ -15,7 +15,9 @@
    [instant.util.tracer :as tracer])
   (:import
    (com.fasterxml.jackson.core.exc StreamConstraintsException)
+   (java.sql SQLException)
    (java.time Instant)
+   (java.util.concurrent CancellationException)
    (org.postgresql.jdbc PgConnection)
    (org.postgresql.replication LogSequenceNumber)))
 
@@ -453,13 +455,42 @@
      :worker-chan chan
      :flush-lsn-chan (a/chan (a/sliding-buffer 1))}))
 
+(defn- retryable-db-error?
+  "A database failure we can wait out: some cause is a SQLException, and
+   nothing says the thread was interrupted or cancelled. The same rule as the
+   invalidator's singleton listener (upstream #2944)."
+  [e]
+  (let [causes (take-while some? (iterate ex-cause e))]
+    (and (some #(instance? SQLException %) causes)
+         (not (.isInterrupted (Thread/currentThread)))
+         (not-any? #(or (instance? InterruptedException %)
+                        (instance? CancellationException %)) causes))))
+
+(defn- record-db-retry!
+  "Records a retryable database failure; rethrows anything else."
+  [e span-name]
+  (if (retryable-db-error? e)
+    (tracer/record-exception-span! e {:name span-name
+                                     :escaping? false})
+    (throw e)))
+
 (defn stop [wal-opts]
   (let [shutdown-future (future (wal/shutdown! wal-opts))]
-    (loop []
+    (loop [kick-failed? false]
       (when-not (realized? shutdown-future)
-        (wal/kick-wal (aurora/conn-pool :write))
-        (Thread/sleep 100)
-        (recur))))
+        (let [failed? (try
+                        (wal/kick-wal (aurora/conn-pool :write))
+                        false
+                        (catch Exception e
+                          ;; Kicking only speeds up shutdown; a DB outage must
+                          ;; not stop cleanup. Record the first failure, not
+                          ;; one span per 100ms retry.
+                          (if kick-failed?
+                            (when-not (retryable-db-error? e) (throw e))
+                            (record-db-retry! e "aggregator/kick-wal-error"))
+                          true))]
+          (Thread/sleep 100)
+          (recur (or kick-failed? failed?))))))
   (a/close! (:to wal-opts))
   (a/close! (:close-signal-chan wal-opts))
   (a/close! (:flush-lsn-chan wal-opts))
@@ -475,9 +506,24 @@
            slot-suffix]}]
   (when (:same-as-read-conn (meta get-conn-config))
     (let [slot-name (wal/full-slot-name slot-type slot-suffix)]
-      (:active (sql/select-one ::fast-active-slot-check
-                               (aurora/conn-pool :read)
-                               ["select active from pg_replication_slots where slot_name = ?" slot-name])))))
+      (try
+        (:active (sql/select-one ::fast-active-slot-check
+                                 (aurora/conn-pool :read)
+                                 ["select active from pg_replication_slots where slot_name = ?" slot-name]))
+        (catch Exception e
+          (record-db-retry! e "aggregator/active-slot-check-error")
+          ;; Wait for the next check when the slot's state is unavailable.
+          true)))))
+
+(defn- start-lsn
+  "The lsn to resume from, or nil (wait and try again) when the database is
+   unreachable."
+  [slot-name]
+  (try
+    (cms/get-start-lsn (aurora/conn-pool :read) {:slot-name slot-name})
+    (catch Exception e
+      (record-db-retry! e "aggregator/get-start-lsn-error")
+      nil)))
 
 (defn start-slot-listener
   "Starts process that will try to acquire the aggregation wal slot every
@@ -512,8 +558,7 @@
                                                :slot-suffix slot-suffix}))
                 (recur (a/timeout acquire-slot-interval-ms))
 
-                (if-let [lsn (cms/get-start-lsn (aurora/conn-pool :read)
-                                                {:slot-name slot-name})]
+                (if-let [lsn (start-lsn slot-name)]
                   (let [{:keys [wal-chan worker-chan flush-lsn-chan close-signal-chan]}
                         (create-wal-chans lsn skip-empty-updates)
 
